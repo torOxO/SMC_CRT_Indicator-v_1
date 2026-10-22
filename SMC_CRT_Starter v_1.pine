@@ -1,0 +1,655 @@
+//@version=5
+// =====================================================================================
+//  SMC + CRT STARTER  —  Advanced SMC (WinWorld / XPYCTuK style) + Candle Range Theory
+// -------------------------------------------------------------------------------------
+//  Version notes
+//    v0.1  First starter. Visual + alert tool (indicator, NOT a strategy).
+//    v0.2  CRT rebuilt from "The Candle Range Theory" notes (Sham / CPI):
+//            - C1 = whole candle is the range; C2 = manipulation (turtle soup) that must CLOSE
+//              BACK INSIDE the range (close outside = low odds -> ignored)
+//            - C3 = distribution; TP1 = 50% of C1 range, TP2 = opposing end of the range
+//            - "Conformational CRT": only count it once C3 closes beyond the 50%
+//            - CRT can be detected on a HIGHER timeframe (Daily / H4) while you work on M15
+//            - Session defaults = the notes' killzones (London 02-05, New York 07-10, NY time)
+//
+//  What it does
+//    * Confirmed-pivot market structure with a state machine (bullish / bearish / init)
+//    * BOS, CHoCH (close-based; wick-only breaks are treated as sweeps, not breaks)
+//    * IDM (inducement) = last pullback in trend direction, with sweep / taken states
+//    * POIs: IDM sweep (IFC-style rejection candle), first OB before IDM (OB-IDM),
+//            sweeps of structural levels (BOS / CHoCH) and sweeps of OB-IDM blocks
+//    * CRT filter: strict 3-candle pattern (range -> manipulation -> distribution)
+//    * Optional Daily bias (request.security, non-repainting) and session filter
+//
+//  Design rules
+//    * All state changes run only on CONFIRMED bars  -> no repainting of signals.
+//    * Pivots are confirmed 'swingLen' bars late; lines/labels are anchored on the
+//      pivot bar (the LEFT side of price), exactly as the guide demands.
+//    * Heavily commented + modular so the 6 entry schemes can be bolted on later
+//      (see the "EXPANSION POINT" comment near the bottom).
+// =====================================================================================
+indicator("SMC + CRT Starter", shorttitle="SMC+CRT", overlay=true, max_bars_back=500, max_boxes_count=250, max_lines_count=250, max_labels_count=250)
+
+// =====================================================================================
+//  INPUTS
+// =====================================================================================
+GRP_STR = "1 · Structure"
+GRP_POI = "2 · POI / Order Blocks"
+GRP_CRT = "3 · CRT filter"
+GRP_HTF = "4 · HTF bias (optional)"
+GRP_SES = "5 · Session filter (optional)"
+GRP_VIS = "6 · Visuals"
+GRP_ALT = "7 · Alerts"
+
+// --- Structure ---
+swingLen = input.int(5, "Swing length (bars each side of a pivot)", minval=2, maxval=30, group=GRP_STR, tooltip="Pivot needs this many lower/higher bars on BOTH sides, so it is confirmed this many bars late (no repaint). Lower = more reactive, higher = cleaner. 5 is a good start for M15.")
+showBOS   = input.bool(true, "Show BOS",   group=GRP_STR)
+showCHoCH = input.bool(true, "Show CHoCH", group=GRP_STR)
+showIDM   = input.bool(true, "Show IDM",   group=GRP_STR)
+
+// --- POI ---
+showOB       = input.bool(true, "Show Order Blocks (OB-IDM)", group=GRP_POI)
+showSweepPOI = input.bool(true, "Show IFC sweep zones",       group=GRP_POI)
+obScan       = input.int(6, "OB imbalance scan (candles)", minval=1, maxval=20, group=GRP_POI, tooltip="Starting at the extreme candle we step forward candle by candle until an imbalance (FVG) is found, as in the guide. This is how many candles we will try.")
+ifcWick      = input.float(0.40, "Min rejection wick (fraction of candle range)", minval=0.1, maxval=0.9, step=0.05, group=GRP_POI, tooltip="A sweep only counts as IFC-style rejection if the wick beyond the level is at least this fraction of the candle's range.")
+maxPOIs      = input.int(12, "Max POI boxes kept", minval=2, maxval=40, group=GRP_POI)
+delMit       = input.bool(true, "Delete POI once mitigated (close beyond far side)", group=GRP_POI)
+
+// --- CRT (per "The Candle Range Theory" notes) ---
+showCRT        = input.bool(true, "Show CRT patterns", group=GRP_CRT)
+crtTf          = input.timeframe("", "CRT timeframe (blank = chart timeframe)", group=GRP_CRT, tooltip="The notes define CRT on HIGHER timeframe candles (Daily / H4) with entries framed on M15. Set e.g. 240 or D here and keep the chart on M15. Must be >= the chart timeframe.")
+crtMode        = input.string("Strict", "CRT strictness", options=["Doc rule", "Strict"], group=GRP_CRT, tooltip="Doc rule: C2 sweeps one extreme of C1 and CLOSES BACK INSIDE C1's range (the notes' high-odds case).\nStrict: additionally C2 sweeps ONE side only, opens inside C1, closes back inside by >=25% of C1's range, and C1 is >= 1 ATR(14). (These extras are my noise filters, not from the notes.)")
+crtNeedConfirm = input.bool(true, "Conformational CRT (C3 must close beyond 50%)", group=GRP_CRT, tooltip="Per the notes: trade only the 3rd candle, after confirmation. A CRT only counts for POI confluence once price closes beyond the 50% of C1's range during C3.")
+crtMaxAge      = input.int(30, "Min CRT validity for confluence (chart bars after C3 starts)", minval=5, maxval=500, group=GRP_CRT, tooltip="Automatically extended to at least one full CRT-timeframe candle.")
+crtBoxBars     = input.int(8, "Min CRT box length (chart bars)", minval=2, maxval=100, group=GRP_CRT)
+showTargets    = input.bool(true, "Label TP1 (50%) / TP2 (opposing end)", group=GRP_CRT)
+
+// --- HTF bias ---
+useHtf = input.bool(false, "Use higher-timeframe (CRT) bias filter", group=GRP_HTF, tooltip="Bias = previous HTF candle was a CRT: it swept the prior candle's low (bullish) or high (bearish) and closed back inside. Neutral bias lets everything through. Only gates ALERTS; drawings stay.")
+htfTf  = input.timeframe("D", "Bias timeframe", group=GRP_HTF)
+
+// --- Session ---
+useSession = input.bool(false, "Only alert inside London / New York killzones", group=GRP_SES, tooltip="Gates ALERTS only. Structure and POIs are always drawn. Defaults are the killzones from the CRT notes (all times New York / EST): London 02:00-05:00, New York 07:00-10:00.")
+londonSess = input.session("0200-0500", "London killzone (New York time)",   group=GRP_SES)
+nySess     = input.session("0700-1000", "New York killzone (New York time)", group=GRP_SES)
+
+// --- Visuals ---
+colBull   = input.color(#089981, "Bullish", group=GRP_VIS)
+colBear   = input.color(#F23645, "Bearish", group=GRP_VIS)
+colNeu    = input.color(#787B86, "Neutral / IDM", group=GRP_VIS)
+boxTransp = input.int(85, "Box transparency", minval=50, maxval=100, group=GRP_VIS)
+lineW     = input.int(1, "Line width", minval=1, maxval=4, group=GRP_VIS)
+showPanel = input.bool(true, "Show status panel", group=GRP_VIS)
+
+// --- Alerts (create the alert from the "Condition" drop-down; use "Once per bar close") ---
+aChoch    = input.bool(true, "Alert: new CHoCH",                       group=GRP_ALT)
+aIdmSweep = input.bool(true, "Alert: IDM swept with rejection",        group=GRP_ALT)
+aPoiCrt   = input.bool(true, "Alert: price enters POI with CRT confluence", group=GRP_ALT)
+
+// =====================================================================================
+//  TYPES
+// =====================================================================================
+// A Point of Interest zone (order block, IFC sweep candle, ...).  dir: 1 = buy zone, -1 = sell zone
+type POI
+    box    bx
+    int    dir
+    string kind
+    float  top
+    float  bot
+    int    born
+    bool   entered
+    bool   dead
+    bool   swept
+
+// A detected CRT (3-candle) pattern.  dir: 1 = bullish (sweep low), -1 = bearish (sweep high)
+type CRT
+    box   bx
+    line  mid
+    label tp
+    int   dir
+    float zTop        // CRT entry area top    (bull: 50% of C1 range | bear: C2 high = invalidation)
+    float zBot        // CRT entry area bottom (bull: C2 low = invalidation | bear: 50% of C1 range)
+    float midV        // 50% of C1 range (first distribution target)
+    int   born        // bar_index of the first chart bar of C3
+    bool  confirmed   // C3 closed beyond 50%
+    bool  dead
+
+// =====================================================================================
+//  GLOBAL STATE  (var = persists between bars)
+// =====================================================================================
+var int   trend      = 0        //  1 bullish, -1 bearish, 0 not initialised yet
+var float bosLvl     = na       // level that must break (close) to continue the trend (BOS)
+var int   bosBar     = na
+var float chLvl      = na       // protected level; a close through it = CHoCH
+var int   chBar      = na
+var float brokenLvl  = na       // last level that was broken (new pivots must beat it)
+var float pbExt      = na       // deepest pullback since the last structural pivot (low in bull, high in bear)
+var int   pbExtBar   = na
+var float runExt     = na       // running extreme in trend direction since last break (high in bull, low in bear)
+var int   runExtBar  = na
+var float lastPH     = na       // last confirmed pivot high / low (used for init + OB search)
+var int   lastPHBar  = na
+var float lastPL     = na
+var int   lastPLBar  = na
+var float idmLvl     = na       // inducement level
+var int   idmBar     = na
+var int   idmState   = 0        // 0 active, 1 swept with rejection, 2 closed through (taken)
+var bool  bosSwept   = false
+var bool  chSwept    = false
+var line  idmLine    = na
+var label idmLbl     = na
+var bool  idmLineLive = false
+
+var array<float> phPx = array.new<float>()   // recent pivot highs (price / bar) for the OB-IDM search
+var array<int>   phBr = array.new<int>()
+var array<float> plPx = array.new<float>()
+var array<int>   plBr = array.new<int>()
+
+var array<POI> pois = array.new<POI>()
+var array<CRT> crts = array.new<CRT>()
+
+// Per-bar event flags (reset every bar, consumed by alertcondition at the bottom)
+bool evChochBull  = false
+bool evChochBear  = false
+bool evIdmSwpBuy  = false
+bool evIdmSwpSell = false
+bool evPoiCrtBull = false
+bool evPoiCrtBear = false
+bool idmChanged   = false
+
+// =====================================================================================
+//  SERIES CALCULATIONS  (must run on every bar, so they live at global scope)
+// =====================================================================================
+// --- Confirmed pivots (value is returned swingLen bars after the pivot bar) ---
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+// Lowest low / highest high from the pivot bar up to the current bar (window = swingLen + 1)
+float lowestVal  = ta.lowest(low, swingLen + 1)
+int   lowestOff  = ta.lowestbars(low, swingLen + 1)
+float highestVal = ta.highest(high, swingLen + 1)
+int   highestOff = ta.highestbars(high, swingLen + 1)
+
+// --- Session windows ---
+bool inLon  = not na(time(timeframe.period, londonSess, "America/New_York"))
+bool inNY   = not na(time(timeframe.period, nySess, "America/New_York"))
+bool sessOk = not useSession or inLon or inNY
+
+// --- HTF bias: previous HTF candle (D-1) vs the one before it (D-2). [1] + lookahead_on = no repaint ---
+[dH1, dL1, dC1, dH2, dL2] = request.security(syminfo.tickerid, htfTf, [high[1], low[1], close[1], high[2], low[2]], lookahead=barmerge.lookahead_on)
+int htfBias = 0
+if dL1 < dL2 and dC1 > dL2 and dC1 < dH2 and dH1 <= dH2
+    htfBias := 1                                  // swept the low, closed back inside, did not take the high
+else if dH1 > dH2 and dC1 < dH2 and dC1 > dL2 and dL1 >= dL2
+    htfBias := -1
+
+// --- CRT detection (notes: C1 = range, C2 = manipulation that closes back inside, C3 = distribution) ---
+// We read the two COMPLETED candles on the CRT timeframe ([2] = C1, [1] = C2) with lookahead_on. That is the
+// standard non-repainting trick: the values are final and constant for the whole of C3 (the forming candle).
+string crtTfEff = crtTf == "" ? timeframe.period : crtTf
+[cT, cH1, cL1, cO2, cH2, cL2, cC2, cAtr] = request.security(syminfo.tickerid, crtTfEff, [time, high[2], low[2], open[1], high[1], low[1], close[1], ta.atr(14)[2]], lookahead=barmerge.lookahead_on)
+bool  newC3   = cT != cT[1]                         // first chart bar of a new C3
+bool  strictC = crtMode == "Strict"
+float insPct  = strictC ? 0.25 : 0.0                // how far back inside C1's range C2 must close
+float c1R     = cH1 - cL1
+bool  c1Ok    = c1R > 0 and (not strictC or c1R >= cAtr)
+// Bullish CRT: C2 purged C1's LOW and closed back inside the range  -> target 50% then C1 high
+bool  bullCRT = newC3 and c1Ok and cL2 < cL1 and cC2 > cL1 + insPct * c1R and cC2 <= cH1 and (not strictC or (cH2 <= cH1 and cO2 >= cL1 and cO2 <= cH1))
+// Bearish CRT: C2 purged C1's HIGH and closed back inside the range -> target 50% then C1 low
+bool  bearCRT = newC3 and c1Ok and cH2 > cH1 and cC2 < cH1 - insPct * c1R and cC2 >= cL1 and (not strictC or (cL2 >= cL1 and cO2 >= cL1 and cO2 <= cH1))
+// Chart bars per CRT-timeframe candle (1 when CRT tf == chart tf)
+float htfBars = math.max(1.0, math.round(timeframe.in_seconds(crtTfEff) / timeframe.in_seconds(timeframe.period)))
+
+// =====================================================================================
+//  HELPER FUNCTIONS
+// =====================================================================================
+
+// Colour by direction
+col(int d) =>
+    d == 1 ? colBull : d == -1 ? colBear : colNeu
+
+// Fraction of the candle range that is wick on the lower (true) or upper (false) side
+wickRatio(bool lower) =>
+    float rng = high - low
+    float wick = lower ? math.min(open, close) - low : high - math.max(open, close)
+    rng > 0 ? wick / rng : 0.0
+
+// Liquidity sweep ABOVE a level: wick through it, close back below, with a real rejection wick (IFC-style)
+sweepAbove(float lvl) =>
+    not na(lvl) and high > lvl and close <= lvl and wickRatio(false) >= ifcWick
+
+// Liquidity sweep BELOW a level
+sweepBelow(float lvl) =>
+    not na(lvl) and low < lvl and close >= lvl and wickRatio(true) >= ifcWick
+
+// Do two price zones overlap?
+overlaps(float aTop, float aBot, float bTop, float bBot) =>
+    aTop >= bBot and aBot <= bTop
+
+// HTF bias gate (neutral bias lets everything through)
+biasOk(int d) =>
+    not useHtf or htfBias == 0 or htfBias == d
+
+// Draw a structural level (BOS / CHoCH): line from the pivot bar to the break bar + centred label
+drawLevel(string txt, int x1, float y, color c, bool show, bool dashed) =>
+    if show and not na(x1) and not na(y)
+        line.new(x1, y, bar_index, y, color=c, width=lineW, style=dashed ? line.style_dashed : line.style_solid)
+        label.new(math.round((x1 + bar_index) / 2), y, txt, style=label.style_none, color=color.new(color.black, 100), textcolor=c, size=size.tiny)
+    0
+
+// Small tag on the current candle (used for sweeps)
+tag(string txt, int d, bool show) =>
+    if show
+        label.new(bar_index, d == -1 ? high : low, txt, style=d == -1 ? label.style_label_down : label.style_label_up, color=col(d), textcolor=color.white, size=size.tiny)
+    0
+
+// Find the most recent stored pivot that is older than 'beforeBar' and above (or below) 'lvl'.
+// Returns its bar_index or na.
+findPivotBar(array<int> brs, array<float> pxs, float lvl, int beforeBar, bool wantAbove) =>
+    int res = na
+    int n = array.size(pxs)
+    if n > 0 and not na(lvl) and not na(beforeBar)
+        for i = n - 1 to 0
+            int b = array.get(brs, i)
+            float px = array.get(pxs, i)
+            if b < beforeBar and (wantAbove ? px > lvl : px < lvl)
+                res := b
+                break
+    res
+
+// Guide-style Order Block search starting at the extreme candle (pivot bar).
+// If that candle has no imbalance we move forward candle by candle (max 'scan' candles).
+//   supply: bearish imbalance  -> low[j] > high[j-2]      demand: bullish imbalance -> high[j] < low[j-2]
+// Returns [top, bottom, leftBarIndex] or [na, na, na].
+findOB(bool isSupply, int pivBar, int scan) =>
+    float t = na
+    float b = na
+    int   l = na
+    if not na(pivBar)
+        int k = bar_index - pivBar
+        if k >= 2 and k <= 400
+            int stopJ = math.max(k - scan, 2)
+            for j = k to stopJ
+                bool imb = isSupply ? low[j] > high[j - 2] : high[j] < low[j - 2]
+                if imb
+                    t := high[j]
+                    b := low[j]
+                    l := bar_index - j
+                    break
+    [t, b, l]
+
+// Create a POI, optionally draw its box, store it and trim the oldest when over the cap.
+addPOI(array<POI> arr, int d, string kind, float top, float bot, int left, bool visible) =>
+    color c = col(d)
+    box bx = na
+    if visible
+        bx := box.new(left, top, bar_index + 1, bot, border_color=color.new(c, 30), bgcolor=color.new(c, boxTransp), extend=extend.right, text=kind, text_size=size.tiny, text_color=c, text_halign=text.align_right, text_valign=text.align_top)
+    array.push(arr, POI.new(bx, d, kind, top, bot, bar_index, false, false, false))
+    if array.size(arr) > maxPOIs
+        POI old = array.shift(arr)
+        if not na(old.bx)
+            box.delete(old.bx)
+    array.size(arr)
+
+// =====================================================================================
+//  MAIN ENGINE  — runs ONLY on confirmed bars (no repaint)
+// =====================================================================================
+if barstate.isconfirmed
+
+    // ---------------------------------------------------------------------------------
+    // 0. Running trackers (extreme of the current leg and of the current pullback)
+    // ---------------------------------------------------------------------------------
+    if trend == 1
+        if high > runExt
+            runExt := high
+            runExtBar := bar_index
+        if not na(pbExt) and low < pbExt
+            pbExt := low
+            pbExtBar := bar_index
+    else if trend == -1
+        if low < runExt
+            runExt := low
+            runExtBar := bar_index
+        if not na(pbExt) and high > pbExt
+            pbExt := high
+            pbExtBar := bar_index
+
+    // ---------------------------------------------------------------------------------
+    // 1. Confirmed pivots -> structural candidates + IDM
+    //    * a new pivot beyond the last structural level = new HH/LL candidate (BOS level)
+    //    * a pivot AGAINST the trend = a valid pullback = new IDM (IDM follows the price)
+    // ---------------------------------------------------------------------------------
+    if not na(ph)
+        int pb = bar_index - swingLen
+        lastPH := ph
+        lastPHBar := pb
+        array.push(phPx, ph)
+        array.push(phBr, pb)
+        if array.size(phPx) > 20
+            array.shift(phPx)
+            array.shift(phBr)
+        if trend == 1
+            if ph > nz(bosLvl, brokenLvl)          // new higher high candidate
+                bosLvl := ph
+                bosBar := pb
+                pbExt := lowestVal                 // pullback tracking restarts at the new high
+                pbExtBar := bar_index + lowestOff
+                bosSwept := false
+        else if trend == -1                        // pivot high in a downtrend = pullback = IDM
+            idmLvl := ph
+            idmBar := pb
+            idmState := 0
+            idmChanged := true
+
+    if not na(pl)
+        int pb = bar_index - swingLen
+        lastPL := pl
+        lastPLBar := pb
+        array.push(plPx, pl)
+        array.push(plBr, pb)
+        if array.size(plPx) > 20
+            array.shift(plPx)
+            array.shift(plBr)
+        if trend == -1
+            if pl < nz(bosLvl, brokenLvl)          // new lower low candidate
+                bosLvl := pl
+                bosBar := pb
+                pbExt := highestVal
+                pbExtBar := bar_index + highestOff
+                bosSwept := false
+        else if trend == 1                         // pivot low in an uptrend = pullback = IDM
+            idmLvl := pl
+            idmBar := pb
+            idmState := 0
+            idmChanged := true
+
+    // ---------------------------------------------------------------------------------
+    // 2. BOS / CHoCH  (BODY CLOSE beyond the level; wick-only = sweep, handled in step 4)
+    // ---------------------------------------------------------------------------------
+    bool brk = false                               // a structural break happened on this bar
+
+    if trend == 0
+        // Initialisation: first close beyond a confirmed pivot defines the first trend
+        if not na(lastPH) and close > lastPH
+            drawLevel("BOS", lastPHBar, lastPH, colBull, showBOS, false)
+            trend := 1
+            brokenLvl := lastPH
+            chLvl := lastPL
+            chBar := lastPLBar
+            idmLvl := lastPL
+            idmBar := lastPLBar
+            idmState := 0
+            idmChanged := true
+            runExt := high
+            runExtBar := bar_index
+            brk := true
+        else if not na(lastPL) and close < lastPL
+            drawLevel("BOS", lastPLBar, lastPL, colBear, showBOS, false)
+            trend := -1
+            brokenLvl := lastPL
+            chLvl := lastPH
+            chBar := lastPHBar
+            idmLvl := lastPH
+            idmBar := lastPHBar
+            idmState := 0
+            idmChanged := true
+            runExt := low
+            runExtBar := bar_index
+            brk := true
+    else
+        bool brokeTrend = not na(bosLvl) and (trend == 1 ? close > bosLvl : close < bosLvl)
+        bool brokeCtr   = not na(chLvl)  and (trend == 1 ? close < chLvl  : close > chLvl)
+
+        if brokeTrend
+            // ---- BOS: trend continues ----
+            drawLevel("BOS", bosBar, bosLvl, col(trend), showBOS, false)
+            brokenLvl := bosLvl
+            // New protected level = deepest pullback that led to this break.
+            // Guide rule: if that point IS the IDM, the CHoCH level stays at its previous position.
+            if not na(pbExt)
+                bool coincide = pbExt == idmLvl
+                bool oldValid = not na(chLvl) and (trend * chLvl < trend * pbExt)
+                if not (coincide and oldValid)
+                    chLvl := pbExt
+                    chBar := pbExtBar
+                    chSwept := false
+            bosLvl := na
+            bosBar := na
+            pbExt := na
+            runExt := trend == 1 ? high : low
+            runExtBar := bar_index
+            brk := true
+        else if brokeCtr
+            // ---- CHoCH: trend reverses ----
+            int newTrend = -trend
+            drawLevel("CHoCH", chBar, chLvl, col(newTrend), showCHoCH, true)
+            float oldCh = chLvl
+            chLvl := runExt                        // protected level of the NEW trend = extreme of the old leg
+            chBar := runExtBar
+            chSwept := false
+            brokenLvl := oldCh
+            trend := newTrend
+            bosLvl := na
+            bosBar := na
+            pbExt := na
+            idmLvl := trend == 1 ? lastPL : lastPH     // first pullback of the new trend
+            idmBar := trend == 1 ? lastPLBar : lastPHBar
+            idmState := 0
+            idmChanged := true
+            runExt := trend == 1 ? high : low
+            runExtBar := bar_index
+            brk := true
+            if trend == 1
+                evChochBull := true
+            else
+                evChochBear := true
+
+    // ---------------------------------------------------------------------------------
+    // 3. IDM: sweep with rejection (IFC) = POI;  close through = taken -> first OB before IDM
+    // ---------------------------------------------------------------------------------
+    if trend != 0 and idmState == 0 and not na(idmLvl) and not brk
+        bool idmSweep = trend == 1 ? sweepBelow(idmLvl) : sweepAbove(idmLvl)
+        bool idmThru  = trend == 1 ? close < idmLvl : close > idmLvl
+        if idmSweep
+            idmState := 1
+            addPOI(pois, trend, "IDM Sweep", high, low, bar_index, showSweepPOI)
+            tag("IDM sweep", trend, showIDM)
+            if sessOk
+                if trend == 1
+                    evIdmSwpBuy := true
+                else
+                    evIdmSwpSell := true
+        else if idmThru
+            idmState := 2
+            // First order block BEFORE the IDM: nearest older pivot beyond the IDM level, then OB search there.
+            //   downtrend -> supply OB above the IDM       uptrend -> demand OB below the IDM
+            int pivB = trend == -1 ? findPivotBar(phBr, phPx, idmLvl, idmBar, true) : findPivotBar(plBr, plPx, idmLvl, idmBar, false)
+            [obT, obB, obL] = findOB(trend == -1, pivB, obScan)
+            if not na(obT)
+                addPOI(pois, trend, "OB-IDM", obT, obB, obL, showOB)
+
+    // ---------------------------------------------------------------------------------
+    // 4. Structural sweeps (liquidity grab of BOS / CHoCH levels with rejection)
+    //    BOS sweep  = counter-trend POI (guide: "Sweeped BOS")   CHoCH sweep = trend-continuation POI
+    // ---------------------------------------------------------------------------------
+    if trend != 0 and not brk
+        if not na(bosLvl) and not bosSwept and (trend == 1 ? sweepAbove(bosLvl) : sweepBelow(bosLvl))
+            bosSwept := true
+            addPOI(pois, -trend, "Sweep BOS", high, low, bar_index, showSweepPOI)
+            tag("BOS swept", -trend, showSweepPOI)
+        if not na(chLvl) and not chSwept and (trend == 1 ? sweepBelow(chLvl) : sweepAbove(chLvl))
+            chSwept := true
+            addPOI(pois, trend, "Sweep CHoCH", high, low, bar_index, showSweepPOI)
+            tag("CHoCH swept", trend, showSweepPOI)
+
+    // ---------------------------------------------------------------------------------
+    // 5. CRT (notes): create when C3 starts, then confirm / invalidate while C3 forms
+    //    Entry area: bull = C2 low .. 50% of C1 range, bear = 50% .. C2 high.  TP1 = 50%, TP2 = opposing end.
+    // ---------------------------------------------------------------------------------
+    if bullCRT != bearCRT                           // exactly one side qualified (ambiguous = skip)
+        int   cd   = bullCRT ? 1 : -1
+        float cm   = (cH1 + cL1) / 2
+        int   blen = math.max(crtBoxBars, int(htfBars))
+        box   cb   = na
+        line  cl   = na
+        label ct   = na
+        if showCRT
+            color cc = col(cd)
+            // Drawn on the C1 range (the notes treat the whole C1 candle, wicks included, as the range)
+            cb := box.new(bar_index, cH1, bar_index + blen, cL1, border_color=color.new(cc, 20), border_style=line.style_dashed, bgcolor=color.new(cc, 93), text=cd == 1 ? "CRT ↑" : "CRT ↓", text_size=size.tiny, text_color=cc, text_halign=text.align_left, text_valign=text.align_top)
+            cl := line.new(bar_index, cm, bar_index + blen, cm, color=color.new(cc, 30), style=line.style_dotted)
+            if showTargets
+                ct := label.new(bar_index + blen, cm, cd == 1 ? "TP1 50% · TP2 high" : "TP1 50% · TP2 low", style=label.style_none, color=color.new(color.black, 100), textcolor=color.new(cc, 20), size=size.tiny)
+        float eTop = cd == 1 ? cm : cH2
+        float eBot = cd == 1 ? cL2 : cm
+        array.push(crts, CRT.new(cb, cl, ct, cd, eTop, eBot, cm, bar_index, false, false))
+        if array.size(crts) > 30
+            array.shift(crts)
+
+    for c in crts
+        if not c.dead
+            int  age  = bar_index - c.born
+            bool bull = c.dir == 1
+            // Invalid: C3 closes beyond C2's extreme (the manipulation was a real break, not a purge)
+            bool invalid = bull ? close < c.zBot : close > c.zTop
+            // C3 window = one CRT-timeframe candle; confluence validity is at least crtMaxAge bars
+            bool c3Over  = age >= int(htfBars)
+            if invalid or age > math.max(crtMaxAge, int(htfBars)) or (not c.confirmed and c3Over)
+                c.dead := true
+                if not c.confirmed                 // unconfirmed = noise -> remove drawings
+                    if not na(c.bx)
+                        box.delete(c.bx)
+                    if not na(c.mid)
+                        line.delete(c.mid)
+                    if not na(c.tp)
+                        label.delete(c.tp)
+            else if not c.confirmed and not c3Over
+                bool dist = bull ? close > c.midV : close < c.midV   // distribution started: closed beyond 50%
+                if dist
+                    c.confirmed := true
+                    if not na(c.bx)
+                        box.set_text(c.bx, bull ? "CRT ✓ ↑" : "CRT ✓ ↓")
+                        box.set_border_style(c.bx, line.style_solid)
+
+    // ---------------------------------------------------------------------------------
+    // 6. POI management: mitigation, OB liquidity grab, entry + CRT confluence
+    // ---------------------------------------------------------------------------------
+    float swpTop = na
+    float swpBot = na
+    int   swpDir = 0
+
+    for p in pois
+        if not p.dead
+            // Mitigated = candle CLOSES beyond the far side of the zone
+            bool mit = p.dir == -1 ? close > p.top : close < p.bot
+            if mit
+                p.dead := true
+                if not na(p.bx)
+                    if delMit
+                        box.delete(p.bx)
+                    else
+                        box.set_extend(p.bx, extend.none)
+                        box.set_right(p.bx, bar_index)
+            else if p.born < bar_index
+                // (a) Liquidity grab of an OB-IDM block: wick through the block, close inside/below it (IFC)
+                if p.kind == "OB-IDM" and not p.swept and swpDir == 0
+                    bool obSw = p.dir == -1 ? sweepAbove(p.top) : sweepBelow(p.bot)
+                    if obSw
+                        p.swept := true
+                        swpDir := p.dir
+                        swpTop := high
+                        swpBot := low
+                // (b) First touch of the zone -> check CRT confluence
+                if not p.entered and high >= p.bot and low <= p.top
+                    p.entered := true
+                    bool confl = false
+                    for c in crts
+                        if not c.dead and c.dir == p.dir and (c.confirmed or not crtNeedConfirm) and (bar_index - c.born) <= crtMaxAge and overlaps(p.top, p.bot, c.zTop, c.zBot)
+                            confl := true
+                    if confl
+                        if not na(p.bx)
+                            box.set_text(p.bx, p.kind + " +CRT")
+                            box.set_border_width(p.bx, 2)
+                        if sessOk and biasOk(p.dir)
+                            if p.dir == 1
+                                evPoiCrtBull := true
+                            else
+                                evPoiCrtBear := true
+
+    // Added after the loop (never modify the array while iterating it)
+    if swpDir != 0
+        addPOI(pois, swpDir, "OB Sweep", swpTop, swpBot, bar_index, showSweepPOI)
+        tag("OB swept", swpDir, showSweepPOI)
+
+    // ---------------------------------------------------------------------------------
+    // 7. IDM line (one live line, finalised when swept / taken, replaced when a newer IDM forms)
+    // ---------------------------------------------------------------------------------
+    if showIDM
+        if idmChanged
+            if idmLineLive and not na(idmLine)
+                line.delete(idmLine)
+                label.delete(idmLbl)
+            if not na(idmLvl)
+                idmLine := line.new(idmBar, idmLvl, bar_index, idmLvl, color=colNeu, width=lineW, style=line.style_dotted)
+                idmLbl  := label.new(bar_index, idmLvl, "IDM", style=label.style_none, color=color.new(color.black, 100), textcolor=colNeu, size=size.tiny)
+                idmLineLive := true
+        if idmLineLive and not na(idmLine)
+            line.set_x2(idmLine, bar_index)
+            label.set_x(idmLbl, bar_index)
+            if idmState != 0
+                idmLineLive := false
+                label.set_text(idmLbl, idmState == 1 ? "IDM swept ✓" : "IDM taken")
+
+    // =================================================================================
+    //  EXPANSION POINT — the 6 entry schemes
+    //  Everything an entry scheme needs is already in the state above:
+    //    trend, chLvl/chBar (CHoCH level), bosLvl/bosBar (BOS level), idmLvl/idmState,
+    //    pois[] (each POI: dir, kind, top, bot, entered, dead), crts[] (CRT zones),
+    //    htfBias, sessOk, and the helpers sweepAbove()/sweepBelow()/findOB()/addPOI().
+    //  Suggested route (run the SAME logic on M1 with its own swingLen):
+    //    1. When price first touches a POI on M15  -> p.entered turns true (hook it here).
+    //    2. Switch to M1: wait for the LTF CHoCH inside the POI (use a second copy of this
+    //       state machine or request.security_lower_tf).
+    //    3. Scheme 1/2: LTF IDM swept -> enter from the first OB after IDM / the IFC candle.
+    //    4. Scheme 3: LTF BOS then IDM sweep. Scheme 4: sweep of a 2nd high inside the POI,
+    //       enter from the IFC without waiting for IDM. Schemes 5-8: treat the small OB
+    //       created by the first reaction as SMT (forbidden) until liquidity is collected.
+    // =================================================================================
+
+// =====================================================================================
+//  STATUS PANEL
+// =====================================================================================
+var table panel = table.new(position.top_right, 2, 6, border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and showPanel
+    int live = 0
+    for p in pois
+        if not p.dead
+            live += 1
+    color hdr = color.new(color.black, 35)
+    table.cell(panel, 0, 0, "Trend",       text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 0, trend == 1 ? "Bullish" : trend == -1 ? "Bearish" : "Init", text_color=color.white, text_size=size.small, bgcolor=color.new(col(trend), 25))
+    table.cell(panel, 0, 1, "IDM",         text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 1, na(idmLvl) ? "-" : idmState == 0 ? "Active" : idmState == 1 ? "Swept ✓" : "Taken", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 0, 2, "HTF bias",    text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 2, not useHtf ? "Off" : htfBias == 1 ? "Bullish" : htfBias == -1 ? "Bearish" : "Neutral", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 0, 3, "Session",     text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 3, not useSession ? "Off" : sessOk ? "In window" : "Outside", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 0, 4, "Live POIs",   text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 4, str.tostring(live), text_color=color.white, text_size=size.small, bgcolor=hdr)
+    string crtTxt = "-"
+    int    crtDir = 0
+    for c in crts
+        if not c.dead
+            crtDir := c.dir
+            crtTxt := (c.dir == 1 ? "Bull " : "Bear ") + (c.confirmed ? "✓ C3" : "pending")
+    table.cell(panel, 0, 5, "CRT (" + crtTfEff + ")", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(panel, 1, 5, crtTxt, text_color=color.white, text_size=size.small, bgcolor=crtDir == 0 ? hdr : color.new(col(crtDir), 25))
+
+// =====================================================================================
+//  ALERTS  (Create Alert -> Condition: this indicator -> pick one -> "Once Per Bar Close")
+// =====================================================================================
+alertcondition(evChochBull  and aChoch,    "CHoCH Bullish",              "{{ticker}} {{interval}}: bullish CHoCH")
+alertcondition(evChochBear  and aChoch,    "CHoCH Bearish",              "{{ticker}} {{interval}}: bearish CHoCH")
+alertcondition(evIdmSwpBuy  and aIdmSweep, "IDM swept (BUY rejection)",  "{{ticker}} {{interval}}: IDM swept below with rejection - look for BUY on LTF")
+alertcondition(evIdmSwpSell and aIdmSweep, "IDM swept (SELL rejection)", "{{ticker}} {{interval}}: IDM swept above with rejection - look for SELL on LTF")
+alertcondition(evPoiCrtBull and aPoiCrt,   "POI + CRT confluence (BUY)",  "{{ticker}} {{interval}}: price entered BUY POI with CRT confluence")
+alertcondition(evPoiCrtBear and aPoiCrt,   "POI + CRT confluence (SELL)", "{{ticker}} {{interval}}: price entered SELL POI with CRT confluence")
